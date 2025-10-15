@@ -1,0 +1,33 @@
+{
+  "name": "pubwiki-lua",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Browser-friendly Lua runtime wrapper with MediaWiki require support",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist",
+    "wasm"
+  ],
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "lua",
+    "wasm",
+    "mediawiki"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
