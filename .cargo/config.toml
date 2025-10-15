@@ -1,0 +1,15 @@
+[target.wasm32-unknown-emscripten]
+rustflags = [
+  "-C", "link-arg=-sMODULARIZE=1",
+  "-C", "link-arg=-sEXPORT_ES6=1",
+  "-C", "link-arg=-sEXPORT_NAME=lua_runner_wasm",
+  "-C", "link-arg=--no-entry",
+  "-C", "link-arg=-sEXPORTED_FUNCTIONS=['_lua_run','_lua_free_last','_malloc','_free']",
+  "-C", "link-arg=-sEXPORTED_RUNTIME_METHODS=['ccall','cwrap','HEAPU8','UTF8ToString','stringToUTF8','lengthBytesUTF8']",
+  "-C", "link-arg=-sENVIRONMENT=web",
+  "-C", "link-arg=-sALLOW_MEMORY_GROWTH=1",
+  "-C", "link-arg=-sASSERTIONS=1",
+  "-C", "link-arg=-sNO_DISABLE_EXCEPTION_CATCHING",
+  "-C", "link-arg=-sSUPPORT_LONGJMP=1",
+  "-C", "link-arg=-sERROR_ON_UNDEFINED_SYMBOLS=0"
+]
