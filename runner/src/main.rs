@@ -3,7 +3,7 @@
 // by the -sEXPORTED_FUNCTIONS link flag configured in .cargo/config.toml.
 
 use mlua::prelude::*;
-use mlua::{Table, Variadic};
+use mlua::{prelude::LuaMultiValue, Table, Variadic};
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_uchar};
@@ -11,6 +11,69 @@ use std::slice;
 
 thread_local! {
     static LAST_RESULT: RefCell<Option<CString>> = RefCell::new(None);
+    static MEDIAWIKI_STACK: RefCell<Vec<String>> = RefCell::new(Vec::new());
+}
+
+struct ResolvedModuleSource {
+    name: String,
+    source: String,
+}
+
+struct MediaWikiGuard {
+    pushed: bool,
+}
+
+impl MediaWikiGuard {
+    fn new(spec: &str) -> Self {
+        let Some(base) = mediawiki_base(spec) else {
+            return MediaWikiGuard { pushed: false };
+        };
+
+        MEDIAWIKI_STACK.with(|stack| stack.borrow_mut().push(base));
+        MediaWikiGuard { pushed: true }
+    }
+}
+
+impl Drop for MediaWikiGuard {
+    fn drop(&mut self) {
+        if self.pushed {
+            MEDIAWIKI_STACK.with(|stack| {
+                stack.borrow_mut().pop();
+            });
+        }
+    }
+}
+
+fn mediawiki_base(spec: &str) -> Option<String> {
+    if !spec.starts_with("mediawiki://") {
+        return None;
+    }
+    let marker = "Module:";
+    let idx = spec.find(marker)?;
+    Some(spec[..idx].to_string())
+}
+
+fn resolve_module_spec(name: &str) -> String {
+    if name.contains("://") {
+        return name.to_string();
+    }
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return name.to_string();
+    }
+    MEDIAWIKI_STACK.with(|stack| {
+        let Some(mut base) = stack.borrow().last().cloned() else {
+            return name.to_string();
+        };
+
+        if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("module:") {
+            base.push_str(trimmed);
+        } else {
+            base.push_str("Module:");
+            base.push_str(trimmed);
+        }
+        base
+    })
 }
 
 #[link(wasm_import_module = "env")]
@@ -52,7 +115,11 @@ fn install_print_collector(lua: &Lua, buffer: &RefCell<String>) -> LuaResult<()>
                     LuaValue::LightUserData(_) => "lightuserdata".to_string(),
                     LuaValue::Integer(i) => i.to_string(),
                     LuaValue::Number(n) => {
-                        if n.fract() == 0.0 { format!("{:.0}", n) } else { n.to_string() }
+                        if n.fract() == 0.0 {
+                            format!("{:.0}", n)
+                        } else {
+                            n.to_string()
+                        }
                     }
                     LuaValue::String(s) => match s.to_str() {
                         Ok(t) => t.to_string(),
@@ -74,47 +141,12 @@ fn install_print_collector(lua: &Lua, buffer: &RefCell<String>) -> LuaResult<()>
         })?
     };
     lua.globals().set("print", print_fn)?;
-
-    // Also capture io.write (no trailing newline)
-    if let Ok(io_table) = lua.globals().get::<Table>("io") {
-        let write_fn = {
-            let buffer = buffer.clone();
-            lua.create_function(move |_lua, values: Variadic<LuaValue>| {
-                for (i, v) in values.iter().enumerate() {
-                    if i > 0 {
-                        // io.write doesn't insert separators by default
-                    }
-                    let s = match v {
-                        LuaValue::Nil => "nil".to_string(),
-                        LuaValue::Boolean(b) => b.to_string(),
-                        LuaValue::LightUserData(_) => "lightuserdata".to_string(),
-                        LuaValue::Integer(i) => i.to_string(),
-                        LuaValue::Number(n) => {
-                            if n.fract() == 0.0 { format!("{:.0}", n) } else { n.to_string() }
-                        }
-                        LuaValue::String(s) => match s.to_str() {
-                            Ok(t) => t.to_string(),
-                            Err(_) => "<invalid utf8>".to_string(),
-                        },
-                        LuaValue::Table(_) => "table".to_string(),
-                        LuaValue::Function(_) => "function".to_string(),
-                        LuaValue::Thread(_) => "thread".to_string(),
-                        LuaValue::UserData(_) => "userdata".to_string(),
-                        LuaValue::Error(e) => e.to_string(),
-                        _ => "<unknown>".to_string(),
-                    };
-                    buffer.borrow_mut().push_str(&s);
-                }
-                Ok(())
-            })?
-        };
-        let _ = io_table.set("write", write_fn);
-    }
     Ok(())
 }
 
-fn fetch_module_source(name: &str) -> LuaResult<String> {
-    let name_c = CString::new(name).map_err(|e| LuaError::external(e))?;
+fn fetch_module_source(name: &str) -> LuaResult<ResolvedModuleSource> {
+    let resolved_name = resolve_module_spec(name);
+    let name_c = CString::new(resolved_name.clone()).map_err(|e| LuaError::external(e))?;
     let mut len: u32 = 0;
     let ptr = unsafe { fetch_lua_module(name_c.as_ptr(), &mut len) };
     if ptr.is_null() {
@@ -138,7 +170,10 @@ fn fetch_module_source(name: &str) -> LuaResult<String> {
         .map(|s| s.to_string())
         .map_err(|e| LuaError::external(e.to_string()))?;
     unsafe { free_lua_module(ptr, len) };
-    Ok(source)
+    Ok(ResolvedModuleSource {
+        name: resolved_name,
+        source,
+    })
 }
 
 fn install_require_loader(lua: &Lua) -> LuaResult<()> {
@@ -146,16 +181,31 @@ fn install_require_loader(lua: &Lua) -> LuaResult<()> {
     let searchers: Table = package.get("searchers")?;
 
     let loader = lua.create_function(|lua, module: String| -> LuaResult<LuaValue> {
-        match fetch_module_source(&module) {
-            Ok(source) => {
-                let func = lua.load(&source).set_name(&module).into_function()?;
-                Ok(LuaValue::Function(func))
-            }
+        let resolved = match fetch_module_source(&module) {
+            Ok(resolved) => resolved,
             Err(err) => {
                 let msg = format!("error loading module '{}': {}", module, err);
-                Ok(LuaValue::String(lua.create_string(&msg)?))
+                let text = lua.create_string(&msg)?;
+                return Ok(LuaValue::String(text));
             }
+        };
+
+        let chunk = lua
+            .load(&resolved.source)
+            .set_name(&resolved.name)
+            .into_function()?;
+
+        if !resolved.name.starts_with("mediawiki://") {
+            return Ok(LuaValue::Function(chunk));
         }
+
+        let resolved_name = resolved.name.clone();
+        let wrapped = lua.create_function(move |_lua, args: LuaMultiValue| {
+            let _guard = MediaWikiGuard::new(&resolved_name);
+            let result: LuaResult<LuaMultiValue> = chunk.call(args);
+            result
+        })?;
+        Ok(LuaValue::Function(wrapped))
     })?;
 
     // Insert custom loader after the Lua preload loader (index 1)
@@ -181,29 +231,33 @@ pub extern "C" fn lua_run(code_ptr: *const c_char) -> *const c_char {
         return set_last_result(format!("error: {}", e));
     }
 
-    let res = lua.load(&code).set_name("input").eval::<LuaValue>();
+    let value = match lua.load(&code).set_name("input").eval::<LuaValue>() {
+        Ok(val) => val,
+        Err(e) => return set_last_result(format!("error: {}", e)),
+    };
 
-    match res {
-        Ok(val) => {
-            if !output.borrow().is_empty() {
-                output.borrow_mut().push_str("-- return --\n");
-            }
-            let ret = match val {
-                LuaValue::Nil => "nil".to_string(),
-                LuaValue::Boolean(b) => b.to_string(),
-                LuaValue::Integer(i) => i.to_string(),
-                LuaValue::Number(n) => n.to_string(),
-                LuaValue::String(s) => match s.to_str() {
-                    Ok(t) => t.to_string(),
-                    Err(_) => "<invalid utf8>".to_string(),
-                },
-                _ => "<non-serializable return>".to_string(),
-            };
-            output.borrow_mut().push_str(&ret);
-            set_last_result(output.borrow().clone())
-        }
-        Err(e) => set_last_result(format!("error: {}", e)),
+    if !output.borrow().is_empty() {
+        output.borrow_mut().push_str("-- return --\n");
     }
+
+    let ret = match value {
+        LuaValue::Nil => "nil".to_string(),
+        LuaValue::Boolean(b) => b.to_string(),
+        LuaValue::Integer(i) => i.to_string(),
+        LuaValue::Number(n) => n.to_string(),
+        LuaValue::String(s) => match s.to_str() {
+            Ok(t) => t.to_string(),
+            Err(_) => "<invalid utf8>".to_string(),
+        },
+        _ => "<non-serializable return>".to_string(),
+    };
+
+    output.borrow_mut().push_str(&ret);
+    let final_output = {
+        let borrowed = output.borrow();
+        borrowed.clone()
+    };
+    set_last_result(final_output)
 }
 
 #[no_mangle]
