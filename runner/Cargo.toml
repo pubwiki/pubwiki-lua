@@ -12,3 +12,8 @@ opt-level = "s"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+[lib]
+name = "lua_runner"
+path = "src/main.rs"
+crate-type = ["cdylib", "rlib"]
