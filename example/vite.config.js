@@ -8,7 +8,8 @@ export default defineConfig({
     port: 5173,
     fs: {
       allow: [path.resolve(__dirname, '..')]
-    }
+    },
+    host: "0.0.0.0"
   },
   publicDir: 'public'
 })

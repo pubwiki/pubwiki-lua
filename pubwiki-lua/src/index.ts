@@ -1,8 +1,64 @@
+import { NamespaceRegistry, type ScriptNamespaceConfig } from './namespace-registry'
+import { NamespaceStateManager, type SetOptions } from './state-manager'
+import type { StorageBackend } from './storage-backend'
+import { 
+  createLuaBridge, 
+  cleanupLuaBridge, 
+  preloadStateCache, 
+  preloadAllStateCache,
+  clearStateCache,
+  js_state_register,
+  js_state_get,
+  js_state_set,
+  js_state_delete,
+  js_state_list
+} from './lua-bridge'
+
 const textEncoder = new TextEncoder()
 const textDecoder = new TextDecoder('utf-8')
 
 const moduleCache = new Map<string, string>()
 const fileModules = new Map<string, string>()
+
+// 状态管理实例
+const namespaceRegistry = new NamespaceRegistry()
+let stateManager: NamespaceStateManager | null = null
+let customBackend: StorageBackend | undefined = undefined
+
+/**
+ * 设置自定义存储后端
+ * 必须在调用 loadRunner() 之前调用
+ * @param backend 自定义存储后端实现
+ */
+export function setStorageBackend(backend: StorageBackend) {
+  if (stateManager) {
+    throw new Error('Cannot set storage backend after state manager has been initialized')
+  }
+  customBackend = backend
+}
+
+/**
+ * 初始化状态管理器
+ * @param backend 可选的自定义存储后端，默认使用 IndexedDB
+ */
+function initStateManager(backend?: StorageBackend) {
+  if (!stateManager) {
+    stateManager = new NamespaceStateManager(namespaceRegistry, backend || customBackend)
+  }
+  return stateManager
+}
+
+// 初始化 Lua 桥接
+createLuaBridge({
+  registerNamespaces,
+  listAccessibleNamespaces,
+  getState,
+  setState,
+  deleteState,
+  listKeys,
+  watchState,
+  getAllRecords: () => initStateManager().getAllRecords()
+})
 
 const DEFAULT_GLUE_PATH = new URL('../wasm/lua_runner_glue.js', import.meta.url).href
 let gluePath = DEFAULT_GLUE_PATH
@@ -57,6 +113,15 @@ function allocateImportBytes(bytes: Uint8Array, module: LuaModule) {
     module.HEAPU8[ptr] = 0
   }
   return { ptr, length }
+}
+
+// 分配 C 字符串（带 null 终止符）
+function allocateCString(str: string, module: LuaModule): number {
+  const bytes = textEncoder.encode(str)
+  const ptr = module._malloc(bytes.length + 1)  // +1 for null terminator
+  module.HEAPU8.set(bytes, ptr)
+  module.HEAPU8[ptr + bytes.length] = 0  // null terminator
+  return ptr
 }
 
 function readCString(ptr: number, module: LuaModule): string {
@@ -275,6 +340,80 @@ export async function loadRunner(customGluePath?: string): Promise<void> {
             return ptr
           }
 
+          // 状态管理 API - Rust 调用的同步函数
+          env.js_state_register = (scriptIdPtr: number, configJsonPtr: number) => {
+            if (!localModule) return 0
+            try {
+              const scriptId = localModule.UTF8ToString(scriptIdPtr)
+              const configJson = localModule.UTF8ToString(configJsonPtr)
+              const result = js_state_register(scriptId, configJson)
+              return allocateCString(result, localModule)
+            } catch (error) {
+              const errMsg = `ERROR:${error instanceof Error ? error.message : String(error)}`
+              return allocateCString(errMsg, localModule)
+            }
+          }
+
+          env.js_state_get = (scriptIdPtr: number, keyPtr: number, defaultJsonPtr: number) => {
+            if (!localModule) return 0
+            try {
+              const scriptId = localModule.UTF8ToString(scriptIdPtr)
+              const key = localModule.UTF8ToString(keyPtr)
+              const defaultJson = localModule.UTF8ToString(defaultJsonPtr)
+              const result = js_state_get(scriptId, key, defaultJson)
+              return allocateCString(result, localModule)
+            } catch (error) {
+              const errMsg = `ERROR:${error instanceof Error ? error.message : String(error)}`
+              return allocateCString(errMsg, localModule)
+            }
+          }
+
+          env.js_state_set = (scriptIdPtr: number, keyPtr: number, valueJsonPtr: number, ttl: number) => {
+            if (!localModule) return 0
+            try {
+              const scriptId = localModule.UTF8ToString(scriptIdPtr)
+              const key = localModule.UTF8ToString(keyPtr)
+              const valueJson = localModule.UTF8ToString(valueJsonPtr)
+              const result = js_state_set(scriptId, key, valueJson, ttl)
+              return allocateCString(result, localModule)
+            } catch (error) {
+              const errMsg = `ERROR:${error instanceof Error ? error.message : String(error)}`
+              return allocateCString(errMsg, localModule)
+            }
+          }
+
+          env.js_state_delete = (scriptIdPtr: number, keyPtr: number) => {
+            if (!localModule) return 0
+            try {
+              const scriptId = localModule.UTF8ToString(scriptIdPtr)
+              const key = localModule.UTF8ToString(keyPtr)
+              const result = js_state_delete(scriptId, key)
+              return allocateCString(result, localModule)
+            } catch (error) {
+              const errMsg = `ERROR:${error instanceof Error ? error.message : String(error)}`
+              return allocateCString(errMsg, localModule)
+            }
+          }
+
+          env.js_state_list = (scriptIdPtr: number, prefixPtr: number) => {
+            if (!localModule) return 0
+            try {
+              const scriptId = localModule.UTF8ToString(scriptIdPtr)
+              const prefix = localModule.UTF8ToString(prefixPtr)
+              const result = js_state_list(scriptId, prefix)
+              return allocateCString(result, localModule)
+            } catch (error) {
+              const errMsg = `ERROR:${error instanceof Error ? error.message : String(error)}`
+              return allocateCString(errMsg, localModule)
+            }
+          }
+
+          env.js_state_free = (ptr: number) => {
+            if (ptr && localModule) {
+              localModule._free(ptr)
+            }
+          }
+
           const wasmPath = resolveResourcePath(basePath, 'lua_runner_wasm.wasm')
           const fetchWasm = () => fetch(wasmPath, { credentials: 'same-origin' })
 
@@ -313,6 +452,11 @@ export async function loadRunner(customGluePath?: string): Promise<void> {
   })()
 
   await modulePromise
+  
+  // 自动预加载所有已存储的状态到缓存
+  await preloadAllStateCache().catch(err => {
+    console.warn('[State] Failed to preload cache on startup:', err)
+  })
 }
 
 export function setGluePath(path: string) {
@@ -344,6 +488,7 @@ export function resetRunnerState() {
   gluePath = DEFAULT_GLUE_PATH
   moduleCache.clear()
   fileModules.clear()
+  cleanupLuaBridge()
 }
 
 export async function runLua(code: string): Promise<string> {
@@ -390,6 +535,124 @@ export function getModuleCacheSize() {
   return moduleCache.size
 }
 
+/**
+ * 注册脚本的命名空间配置
+ */
+export function registerNamespaces(scriptId: string, config: ScriptNamespaceConfig): void {
+  namespaceRegistry.registerScript(scriptId, config)
+}
+
+/**
+ * 注销脚本
+ */
+export function unregisterScript(scriptId: string): void {
+  namespaceRegistry.unregisterScript(scriptId)
+}
+
+/**
+ * 列出脚本可访问的命名空间
+ */
+export function listAccessibleNamespaces(scriptId: string): string[] {
+  return namespaceRegistry.listAccessible(scriptId)
+}
+
+/**
+ * 获取状态值
+ */
+export async function getState(scriptId: string, key: string, defaultValue?: unknown): Promise<unknown> {
+  return initStateManager().get(scriptId, key, defaultValue)
+}
+
+/**
+ * 设置状态值
+ */
+export async function setState(scriptId: string, key: string, value: unknown, options?: SetOptions): Promise<void> {
+  return initStateManager().set(scriptId, key, value, options)
+}
+
+/**
+ * 删除状态值
+ */
+export async function deleteState(scriptId: string, key: string): Promise<void> {
+  return initStateManager().delete(scriptId, key)
+}
+
+/**
+ * 列出匹配前缀的所有 key
+ */
+export async function listKeys(scriptId: string, prefix: string): Promise<string[]> {
+  return initStateManager().list(scriptId, prefix)
+}
+
+/**
+ * 监听状态变化
+ */
+export function watchState(scriptId: string, key: string, callback: (value: unknown) => void): () => void {
+  return initStateManager().watch(scriptId, key, callback)
+}
+
+/**
+ * 清理过期数据
+ */
+export async function cleanupExpiredState(): Promise<number> {
+  return initStateManager().cleanupExpired()
+}
+
+/**
+ * 清空所有状态数据
+ */
+export async function clearAllState(): Promise<void> {
+  return initStateManager().clear()
+}
+
+/**
+ * 预加载状态到同步缓存
+ * 在运行 Lua 脚本前调用，避免缓存未命中
+ */
+export async function preloadState(scriptId: string, keys: string[]): Promise<void> {
+  return preloadStateCache({
+    registerNamespaces,
+    listAccessibleNamespaces,
+    getState,
+    setState,
+    deleteState,
+    listKeys,
+    watchState,
+    getAllRecords: () => initStateManager().getAllRecords()
+  }, scriptId, keys)
+}
+
+/**
+ * 预加载所有状态到缓存
+ * loadRunner 会自动调用此函数
+ */
+export async function preloadAllState(): Promise<void> {
+  return preloadAllStateCache()
+}
+
+/**
+ * 清理状态缓存
+ */
+export function clearCache(scriptId?: string): void {
+  clearStateCache(scriptId)
+}
+
+/**
+ * 获取所有状态记录（用于调试和查看）
+ */
+export async function getAllStateRecords() {
+  return initStateManager().getAllRecords()
+}
+
 export type { LuaModule }
+export type { ScriptNamespaceConfig } from './namespace-registry'
+export type { SetOptions, StateRecord } from './state-manager'
+export type { StorageBackend } from './storage-backend'
+export { IndexedDBBackend, MemoryBackend, LocalStorageBackend } from './storage-backend'
 
 export { DEFAULT_GLUE_PATH }
+
+// 导出 IndexedDB 配置常量
+export const STATE_DB_NAME = 'pubwiki_lua_state'
+export const STATE_DB_VERSION = 3  // 升级到版本 3
+export const STATE_STORE_NAME = 'namespace_data'

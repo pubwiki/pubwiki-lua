@@ -82,6 +82,14 @@ extern "C" {
     fn fetch_lua_module(url_ptr: *const c_char, len_out: *mut u32) -> *const c_uchar;
     fn free_lua_module(ptr: *const c_uchar, len: u32);
     fn get_last_fetch_error(len_out: *mut u32) -> *const c_uchar;
+    
+    // 状态管理 API（同步接口）
+    fn js_state_register(script_id_ptr: *const c_char, config_json_ptr: *const c_char) -> *const c_char;
+    fn js_state_get(script_id_ptr: *const c_char, key_ptr: *const c_char, default_json_ptr: *const c_char) -> *const c_char;
+    fn js_state_set(script_id_ptr: *const c_char, key_ptr: *const c_char, value_json_ptr: *const c_char, ttl: i32) -> *const c_char;
+    fn js_state_delete(script_id_ptr: *const c_char, key_ptr: *const c_char) -> *const c_char;
+    fn js_state_list(script_id_ptr: *const c_char, prefix_ptr: *const c_char) -> *const c_char;
+    fn js_state_free(ptr: *const c_char);
 }
 
 fn set_last_result(s: String) -> *const c_char {
@@ -253,6 +261,138 @@ fn install_require_loader(lua: &Lua) -> LuaResult<()> {
     Ok(())
 }
 
+/// 安装状态管理 API 到 Lua 全局环境
+fn install_state_api(lua: &Lua) -> LuaResult<()> {
+    let state_table = lua.create_table()?;
+    
+    // State.register(config) - 注册命名空间
+    let register_fn = lua.create_function(|lua, config: LuaValue| -> LuaResult<()> {
+        // 获取当前脚本ID
+        let script_id: String = lua.globals().get("__SCRIPT_ID")
+            .unwrap_or_else(|_| "unknown".to_string());
+        
+        // 将 config 转为 JSON
+        let config_json = lua_value_to_json(lua, &config)?;
+        let script_id_c = CString::new(script_id).map_err(|e| LuaError::external(e))?;
+        let config_c = CString::new(config_json).map_err(|e| LuaError::external(e))?;
+        
+        let result_ptr = unsafe { js_state_register(script_id_c.as_ptr(), config_c.as_ptr()) };
+        let result = read_c_string(result_ptr)?;
+        unsafe { js_state_free(result_ptr) };
+        
+        if result.starts_with("ERROR:") {
+            return Err(LuaError::external(result.trim_start_matches("ERROR:")));
+        }
+        Ok(())
+    })?;
+    state_table.set("register", register_fn)?;
+    
+    // State.get(key, default) - 获取状态
+    let get_fn = lua.create_function(|lua, (key, default): (String, Option<LuaValue>)| -> LuaResult<LuaValue> {
+        let script_id: String = lua.globals().get("__SCRIPT_ID")
+            .unwrap_or_else(|_| "unknown".to_string());
+        
+        let default_json = match default {
+            Some(val) => lua_value_to_json(lua, &val)?,
+            None => "null".to_string(),
+        };
+        
+        let script_id_c = CString::new(script_id).map_err(|e| LuaError::external(e))?;
+        let key_c = CString::new(key).map_err(|e| LuaError::external(e))?;
+        let default_c = CString::new(default_json).map_err(|e| LuaError::external(e))?;
+        
+        let result_ptr = unsafe { js_state_get(script_id_c.as_ptr(), key_c.as_ptr(), default_c.as_ptr()) };
+        let result = read_c_string(result_ptr)?;
+        unsafe { js_state_free(result_ptr) };
+        
+        if result.starts_with("ERROR:") {
+            return Err(LuaError::external(result.trim_start_matches("ERROR:")));
+        }
+        
+        json_to_lua_value(lua, &result)
+    })?;
+    state_table.set("get", get_fn)?;
+    
+    // State.set(key, value, ttl?) - 设置状态
+    let set_fn = lua.create_function(|lua, (key, value, ttl): (String, LuaValue, Option<i32>)| -> LuaResult<()> {
+        let script_id: String = lua.globals().get("__SCRIPT_ID")
+            .unwrap_or_else(|_| "unknown".to_string());
+        
+        let value_json = lua_value_to_json(lua, &value)?;
+        let script_id_c = CString::new(script_id).map_err(|e| LuaError::external(e))?;
+        let key_c = CString::new(key).map_err(|e| LuaError::external(e))?;
+        let value_c = CString::new(value_json).map_err(|e| LuaError::external(e))?;
+        
+        let result_ptr = unsafe { js_state_set(script_id_c.as_ptr(), key_c.as_ptr(), value_c.as_ptr(), ttl.unwrap_or(-1)) };
+        let result = read_c_string(result_ptr)?;
+        unsafe { js_state_free(result_ptr) };
+        
+        if result.starts_with("ERROR:") {
+            return Err(LuaError::external(result.trim_start_matches("ERROR:")));
+        }
+        Ok(())
+    })?;
+    state_table.set("set", set_fn)?;
+    
+    // State.delete(key) - 删除状态
+    let delete_fn = lua.create_function(|lua, key: String| -> LuaResult<()> {
+        let script_id: String = lua.globals().get("__SCRIPT_ID")
+            .unwrap_or_else(|_| "unknown".to_string());
+        
+        let script_id_c = CString::new(script_id).map_err(|e| LuaError::external(e))?;
+        let key_c = CString::new(key).map_err(|e| LuaError::external(e))?;
+        
+        let result_ptr = unsafe { js_state_delete(script_id_c.as_ptr(), key_c.as_ptr()) };
+        let result = read_c_string(result_ptr)?;
+        unsafe { js_state_free(result_ptr) };
+        
+        if result.starts_with("ERROR:") {
+            return Err(LuaError::external(result.trim_start_matches("ERROR:")));
+        }
+        Ok(())
+    })?;
+    state_table.set("delete", delete_fn)?;
+    
+    // State.list(prefix) - 列出键
+    let list_fn = lua.create_function(|lua, prefix: String| -> LuaResult<LuaValue> {
+        let script_id: String = lua.globals().get("__SCRIPT_ID")
+            .unwrap_or_else(|_| "unknown".to_string());
+        
+        let script_id_c = CString::new(script_id).map_err(|e| LuaError::external(e))?;
+        let prefix_c = CString::new(prefix).map_err(|e| LuaError::external(e))?;
+        
+        let result_ptr = unsafe { js_state_list(script_id_c.as_ptr(), prefix_c.as_ptr()) };
+        let result = read_c_string(result_ptr)?;
+        unsafe { js_state_free(result_ptr) };
+        
+        if result.starts_with("ERROR:") {
+            return Err(LuaError::external(result.trim_start_matches("ERROR:")));
+        }
+        
+        json_to_lua_value(lua, &result)
+    })?;
+    state_table.set("list", list_fn)?;
+    
+    lua.globals().set("State", state_table)?;
+    Ok(())
+}
+
+/// 将 Lua 值转换为 JSON 字符串（使用 serde_json）
+fn lua_value_to_json(lua: &Lua, value: &LuaValue) -> LuaResult<String> {
+    // 使用 mlua 的序列化功能
+    let json_value: serde_json::Value = lua.from_value(value.clone())?;
+    serde_json::to_string(&json_value)
+        .map_err(|e| LuaError::external(format!("JSON stringify error: {}", e)))
+}
+
+/// 将 JSON 字符串转换为 Lua 值（使用 serde_json）
+fn json_to_lua_value(lua: &Lua, json: &str) -> LuaResult<LuaValue> {
+    let json_value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| LuaError::external(format!("JSON parse error: {}", e)))?;
+    
+    lua.to_value(&json_value)
+}
+
 #[no_mangle]
 pub extern "C" fn lua_run(code_ptr: *const c_char) -> *const c_char {
     let code = match read_c_string(code_ptr) {
@@ -272,6 +412,10 @@ pub extern "C" fn lua_run(code_ptr: *const c_char) -> *const c_char {
     }
 
     if let Err(e) = install_require_loader(&lua) {
+        return set_last_result(format!("error: {}", e));
+    }
+
+    if let Err(e) = install_state_api(&lua) {
         return set_last_result(format!("error: {}", e));
     }
 

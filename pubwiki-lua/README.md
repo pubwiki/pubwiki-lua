@@ -10,6 +10,11 @@ A small TypeScript library that wraps the Emscripten-compiled Lua runtime, inclu
   - Arbitrary HTTP/HTTPS URLs.
   - Ephemeral file uploads you register at runtime.
 - Friendly helpers for managing file-module lifecycle and cache state.
+- **Namespace state management** with pluggable storage backends:
+  - Built-in IndexedDB backend (default)
+  - Built-in Memory backend (for testing)
+  - Built-in LocalStorage backend (for simple cases)
+  - Custom backend interface for advanced use cases
 
 ## Installation
 
@@ -44,6 +49,56 @@ console.log(output) // => Hi, 世界
 
 clearRemoteModuleCache()
 ```
+
+## State Management
+
+pubwiki-lua includes a built-in state management system with pluggable storage backends. By default, state is persisted in IndexedDB.
+
+### Basic Usage
+
+```ts
+import { loadRunner, runLua, registerNamespaces } from 'pubwiki-lua'
+
+await loadRunner()
+
+// Register namespace access for a script
+registerNamespaces('my-script', {
+  allowedNamespaces: ['default', 'user-data'],
+  defaultNamespace: 'default'
+})
+
+// Use state in Lua
+const result = await runLua(`
+  -- Set state (persists across page reloads)
+  State.set("count", 42)
+  
+  -- Get state
+  local count = State.get("count")
+  
+  -- Use with default value
+  local name = State.get("username", "anonymous")
+  
+  return "Count: " .. count
+`, 'my-script')
+```
+
+### Custom Storage Backends
+
+You can use a different storage backend or implement your own:
+
+```ts
+import { loadRunner, setStorageBackend, MemoryBackend } from 'pubwiki-lua'
+
+// Use in-memory storage (doesn't persist)
+setStorageBackend(new MemoryBackend())
+await loadRunner()
+```
+
+See [STORAGE_BACKENDS.md](./STORAGE_BACKENDS.md) for complete documentation on:
+- Built-in backends (IndexedDB, Memory, LocalStorage)
+- Creating custom backends
+- Advanced examples (Remote API, Hybrid caching, Encryption)
+- Testing and best practices
 
 ## Assets
 
