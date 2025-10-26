@@ -9,6 +9,7 @@ import {
   clearCache,
   getAllStateRecords
 } from 'pubwiki-lua'
+import NamespaceTest from './NamespaceTest'
 
 export default function App() {
   const [ready, setReady] = useState(false)
@@ -17,7 +18,7 @@ export default function App() {
   const [err, setErr] = useState('')
   const [files, setFiles] = useState([])
   const [stateData, setStateData] = useState([])
-  const [activeTab, setActiveTab] = useState('lua') // 'lua' or 'state'
+  const [activeTab, setActiveTab] = useState('lua') // 'lua', 'state', or 'namespace-test'
 
   useEffect(() => {
     loadRunner()
@@ -51,7 +52,7 @@ export default function App() {
     setErr('')
     setOutput('Running...')
     try {
-      const res = await runLua(code)
+      const res = await runLua(code, 'default-script')
       setOutput(res)
     } catch (e) {
       setErr(String(e))
@@ -74,8 +75,6 @@ export default function App() {
       })
 
       const res = await runLua(`
-_G.__SCRIPT_ID = "test_basic_v1"
-
 -- State 表已由 Rust 注入，直接使用
 local level = State.get("game.player.level", 1)
 print("当前等级:", level)
@@ -93,7 +92,7 @@ local name = State.get("game.player.name")
 print("验证: 等级=" .. tostring(new_level) .. ", 名称=" .. tostring(name))
 
 return string.format("✅ 测试完成！等级: %d, 名称: %s", new_level, name)
-      `)
+      `, 'test_basic_v1')
       setOutput(res)
     } catch (e) {
       setErr(String(e))
@@ -116,11 +115,10 @@ return string.format("✅ 测试完成！等级: %d, 名称: %s", new_level, nam
       })
 
       await runLua(`
-_G.__SCRIPT_ID = "scriptA_v1"
 State.set("events.world.bossDefeated", true)
 State.set("events.world.bossName", "炎龙")
 print("[脚本A] 设置世界事件（共享）")
-      `)
+      `, 'scriptA_v1')
 
       // 脚本 B：读取共享数据
       registerNamespaces('scriptB_v1', {
@@ -133,8 +131,6 @@ print("[脚本A] 设置世界事件（共享）")
       })
 
       const res = await runLua(`
-_G.__SCRIPT_ID = "scriptB_v1"
-
 print("[脚本B] 尝试读取共享命名空间...")
 
 local defeated = State.get("events.world.bossDefeated")
@@ -153,7 +149,7 @@ if not success then
 end
 
 return string.format("✅ 成功读取共享数据：%s 已被击败", name)
-      `)
+      `, 'scriptB_v1')
       setOutput(res)
     } catch (e) {
       setErr(String(e))
@@ -227,6 +223,20 @@ return string.format("✅ 成功读取共享数据：%s 已被击败", name)
         >
           状态管理测试
         </button>
+        <button 
+          onClick={() => setActiveTab('namespace-test')}
+          style={{ 
+            padding: '0.5rem 1rem', 
+            border: 'none', 
+            background: activeTab === 'namespace-test' ? '#0066cc' : 'transparent',
+            color: activeTab === 'namespace-test' ? 'white' : '#666',
+            cursor: 'pointer',
+            borderRadius: '4px 4px 0 0',
+            marginLeft: '0.25rem'
+          }}
+        >
+          命名空间隔离测试
+        </button>
       </div>
 
       {activeTab === 'lua' ? (
@@ -272,7 +282,7 @@ return string.format("✅ 成功读取共享数据：%s 已被击败", name)
           <pre style={{ background: '#f7f7f7', padding: '1rem', minHeight: '120px', whiteSpace: 'pre-wrap' }}>{output}</pre>
           <p style={{ color: '#666' }}>提示：print 输出会被捕获；表达式的返回值也会显示在输出尾部。</p>
         </>
-      ) : (
+      ) : activeTab === 'state' ? (
         <>
           <div style={{ margin: '1rem 0', padding: '0.75rem', background: '#f8f9fb', borderRadius: 8, border: '1px solid #e0e4ea' }}>
             <h3 style={{ marginTop: 0 }}>🧪 状态管理系统测试</h3>
@@ -331,6 +341,8 @@ return string.format("✅ 成功读取共享数据：%s 已被击败", name)
             </div>
           )}
         </>
+      ) : (
+        <NamespaceTest />
       )}
     </div>
   )

@@ -1,0 +1,19 @@
+# Source files (we publish the compiled version)
+src/
+tsconfig.json
+*.tsbuildinfo
+
+# Development files
+.DS_Store
+node_modules/
+
+# Documentation that doesn't need to be in the package
+STORAGE_BACKEND_SUMMARY.md
+
+# Git files
+.git/
+.gitignore
+
+# Example and other dev artifacts
+example/
+target/

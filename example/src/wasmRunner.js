@@ -11,5 +11,15 @@ export {
   resetRunnerState,
   getModuleCacheSize,
   DEFAULT_GLUE_PATH,
-  getDefaultGluePath
+  getDefaultGluePath,
+  registerNamespaces,
+  unregisterScript,
+  listAccessibleNamespaces,
+  getState,
+  setState,
+  deleteState,
+  listKeys,
+  watchState,
+  clearAllState,
+  getAllStateRecords
 } from 'pubwiki-lua'

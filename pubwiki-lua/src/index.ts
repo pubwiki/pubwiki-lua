@@ -52,6 +52,7 @@ function initStateManager(backend?: StorageBackend) {
 createLuaBridge({
   registerNamespaces,
   listAccessibleNamespaces,
+  resolveKey,
   getState,
   setState,
   deleteState,
@@ -69,16 +70,16 @@ let heapU8: Uint8Array | null = null
 let heapU32: Uint32Array | null = null
 let lastFetchError: string | null = null
 
-interface LuaModule {
+interface EmscriptenModule {
   HEAPU8: Uint8Array
+  UTF8ToString(ptr: number): string
+}
+
+interface LuaModule extends EmscriptenModule {
+  _lua_run(codePtr: number, scriptIdPtr: number): number
+  _lua_free_result(ptr: number): void
   _malloc(size: number): number
   _free(ptr: number): void
-  _lua_run(ptr: number): number
-  _lua_free_last(ptr: number): void
-  UTF8ToString(ptr: number): string
-  stringToUTF8?(input: string, ptr: number, maxBytesToWrite: number): void
-  HEAPU32?: Uint32Array
-  [key: string]: unknown
 }
 
 type LuaModuleFactory = (options: Record<string, unknown>) => LuaModule | Promise<LuaModule>
@@ -491,20 +492,65 @@ export function resetRunnerState() {
   cleanupLuaBridge()
 }
 
-export async function runLua(code: string): Promise<string> {
+/**
+ * 运行 Lua 代码
+ * @param code Lua 代码字符串
+ * @param scriptId 脚本ID，用于权限控制和状态隔离
+ * @returns Lua 代码的输出结果
+ */
+export async function runLua(scriptId: string, code: string): Promise<string> {
   await loadRunner()
   const module = ensureModule()
-  const bytes = textEncoder.encode(`${code}\0`)
-  const ptr = module._malloc(bytes.length)
-  module.HEAPU8.set(bytes, ptr)
-  const resultPtr = module._lua_run(ptr)
-  let output = ''
-  if (resultPtr) {
-    output = readCString(resultPtr, module)
-    module._lua_free_last(resultPtr)
+  
+  // 分配输入内存
+  const codeBytes = textEncoder.encode(`${code}\0`)
+  const codePtr = module._malloc(codeBytes.length)
+  module.HEAPU8.set(codeBytes, codePtr)
+  
+  const scriptIdBytes = textEncoder.encode(`${scriptId}\0`)
+  const scriptIdPtr = module._malloc(scriptIdBytes.length)
+  module.HEAPU8.set(scriptIdBytes, scriptIdPtr)
+  
+  try {
+    // 调用 lua_run，传入代码和 scriptId
+    const resultPtr = module._lua_run(codePtr, scriptIdPtr)
+    
+    try {
+      if (resultPtr) {
+        const responseStr = readCString(resultPtr, module)
+        
+        // 解析统一的响应格式: {"result": ..., "error": null} 或 {"result": null, "error": "..."}
+        try {
+          const response = JSON.parse(responseStr)
+          
+          // 检查是否有错误
+          if (response.error !== null && response.error !== undefined) {
+            throw new Error(response.error)
+          }
+          
+          // 返回结果的 JSON 字符串表示
+          return JSON.stringify(response.result)
+        } catch (e) {
+          // 如果 JSON 解析失败，这不应该发生（因为 Rust 总是返回有效的 JSON）
+          if (e instanceof SyntaxError) {
+            throw new Error(`Invalid response from Lua runner: ${responseStr}`)
+          }
+          // 重新抛出其他错误（包括我们抛出的 Error）
+          throw e
+        }
+      }
+      return 'null'
+    } finally {
+      // 确保总是释放 Rust 分配的结果内存
+      if (resultPtr) {
+        module._lua_free_result(resultPtr)
+      }
+    }
+  } finally {
+    // 确保总是释放输入内存
+    module._free(codePtr)
+    module._free(scriptIdPtr)
   }
-  module._free(ptr)
-  return output
 }
 
 export function registerFileModule(identifier: string, source: string) {
@@ -554,6 +600,14 @@ export function unregisterScript(scriptId: string): void {
  */
 export function listAccessibleNamespaces(scriptId: string): string[] {
   return namespaceRegistry.listAccessible(scriptId)
+}
+
+/**
+ * 解析 key 为完整的存储 key
+ * 内部函数，供 lua-bridge 使用
+ */
+function resolveKey(scriptId: string, key: string): string {
+  return namespaceRegistry.resolveKey(scriptId, key)
 }
 
 /**
@@ -613,6 +667,7 @@ export async function preloadState(scriptId: string, keys: string[]): Promise<vo
   return preloadStateCache({
     registerNamespaces,
     listAccessibleNamespaces,
+    resolveKey,
     getState,
     setState,
     deleteState,

@@ -39,7 +39,7 @@ export class NamespaceStateManager {
   private registry: NamespaceRegistry
   private backend: StorageBackend
   private cache = new Map<string, unknown>()
-  private tempStorage = new Map<string, unknown>()  // 非持久化临时存储
+  private nonPersistentStorage = new Map<string, unknown>()  // 非持久化存储
   private watchers = new Map<string, StateWatcher[]>()
   private initialized = false
   
@@ -79,21 +79,25 @@ export class NamespaceStateManager {
    * 获取状态值
    */
   async get(scriptId: string, key: string, defaultValue?: unknown): Promise<unknown> {
-    const { config } = this.registry.checkPermission(scriptId, key, 'read')
+    // 将用户的 key 转换为完整的存储 key
+    const fullKey = this.registry.resolveKey(scriptId, key)
     
-    // 临时存储
+    // 检查权限
+    const { config } = this.registry.checkPermission(scriptId, fullKey, 'read')
+    
+    // 非持久化存储
     if (!config.persistent) {
-      return this.tempStorage.get(key) ?? defaultValue
+      return this.nonPersistentStorage.get(fullKey) ?? defaultValue
     }
     
     // 先查缓存
-    if (this.cache.has(key)) {
-      return this.cache.get(key)
+    if (this.cache.has(fullKey)) {
+      return this.cache.get(fullKey)
     }
     
     // 查存储后端
     await this.ensureInitialized()
-    const record = await this.backend.get(key)
+    const record = await this.backend.get(fullKey)
     
     // 检查是否过期
     if (record && record.expireAt && Date.now() > record.expireAt) {
@@ -104,7 +108,7 @@ export class NamespaceStateManager {
     
     const value = record?.value ?? defaultValue
     if (value !== undefined) {
-      this.cache.set(key, value)
+      this.cache.set(fullKey, value)
     }
     return value
   }
@@ -113,29 +117,33 @@ export class NamespaceStateManager {
    * 设置状态值
    */
   async set(scriptId: string, key: string, value: unknown, options: SetOptions = {}): Promise<void> {
-    const { namespace, config } = this.registry.checkPermission(scriptId, key, 'write')
+    // 将用户的 key 转换为完整的存储 key
+    const fullKey = this.registry.resolveKey(scriptId, key)
+    
+    // 检查权限
+    const { namespace, config } = this.registry.checkPermission(scriptId, fullKey, 'write')
     
     // 合并 TTL 配置
     const ttl = options.ttl ?? config.ttl
     
-    // 临时存储
+    // 非持久化存储
     if (!config.persistent) {
-      this.tempStorage.set(key, value)
-      this.notifyWatchers(key, value)
+      this.nonPersistentStorage.set(fullKey, value)
+      this.notifyWatchers(fullKey, value)
       return
     }
     
     // 更新缓存
-    this.cache.set(key, value)
+    this.cache.set(fullKey, value)
     
     // 写入存储后端
     await this.ensureInitialized()
     
     const record: StateRecord = {
-      fullKey: key,
+      fullKey,
       namespace,
       scriptId: config.shared ? null : scriptId,
-      path: key.split('.'),
+      path: fullKey.split('.'),
       value,
       timestamp: Date.now(),
       expireAt: ttl ? Date.now() + ttl : null,
@@ -143,35 +151,42 @@ export class NamespaceStateManager {
     }
     
     await this.backend.set(record)
-    this.notifyWatchers(key, value)
+    this.notifyWatchers(fullKey, value)
   }
   
   /**
    * 删除状态值
    */
   async delete(scriptId: string, key: string): Promise<void> {
-    const { config } = this.registry.checkPermission(scriptId, key, 'write')
+    // 将用户的 key 转换为完整的存储 key
+    const fullKey = this.registry.resolveKey(scriptId, key)
+    
+    // 检查权限
+    const { config } = this.registry.checkPermission(scriptId, fullKey, 'write')
     
     if (!config.persistent) {
-      this.tempStorage.delete(key)
-      this.notifyWatchers(key, undefined)
+      this.nonPersistentStorage.delete(fullKey)
+      this.notifyWatchers(fullKey, undefined)
       return
     }
     
-    this.cache.delete(key)
+    this.cache.delete(fullKey)
     await this.ensureInitialized()
-    await this.backend.delete(key)
-    this.notifyWatchers(key, undefined)
+    await this.backend.delete(fullKey)
+    this.notifyWatchers(fullKey, undefined)
   }
   
   /**
    * 列出前缀匹配的所有 key
    */
   async list(scriptId: string, prefix: string): Promise<string[]> {
+    // 将用户的 prefix 转换为完整的存储 prefix
+    const fullPrefix = this.registry.resolveKey(scriptId, prefix)
+    
     // 验证至少有一个命名空间匹配
     const accessibleNamespaces = this.registry.listAccessible(scriptId)
     const matchingNamespace = accessibleNamespaces.find(ns => 
-      prefix.startsWith(ns) || ns.startsWith(prefix)
+      fullPrefix.startsWith(ns) || ns.startsWith(fullPrefix)
     )
     
     if (!matchingNamespace) {
@@ -180,8 +195,8 @@ export class NamespaceStateManager {
     
     const results: string[] = []
     
-    // 从临时存储查找
-    for (const key of this.tempStorage.keys()) {
+    // 从非持久化存储查找
+    for (const key of this.nonPersistentStorage.keys()) {
       if (key.startsWith(prefix)) {
         results.push(key)
       }
@@ -269,7 +284,7 @@ export class NamespaceStateManager {
    */
   async clear(): Promise<void> {
     this.cache.clear()
-    this.tempStorage.clear()
+    this.nonPersistentStorage.clear()
     await this.ensureInitialized()
     await this.backend.clear()
   }

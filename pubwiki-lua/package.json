@@ -11,16 +11,20 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
-    }
+    },
+    "./wasm/*": "./wasm/*"
   },
   "sideEffects": false,
   "files": [
     "dist",
-    "wasm"
+    "wasm",
+    "src"
   ],
   "scripts": {
     "build": "tsc --project tsconfig.json",
-    "clean": "rm -rf dist"
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run clean && npm run build"
   },
   "keywords": [
     "lua",

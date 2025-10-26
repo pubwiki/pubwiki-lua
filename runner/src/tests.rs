@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::{lua_run, lua_free_last};
+    use crate::{lua_run, lua_free_result};
     use std::ffi::{CStr, CString, c_char, c_uchar};
 
     // 模拟 WASM 导入函数（测试时不需要实际实现）

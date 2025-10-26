@@ -12,6 +12,7 @@ import { STATE_DB_NAME, STATE_DB_VERSION, STATE_STORE_NAME } from './index'
 type StateAPI = {
   registerNamespaces: (scriptId: string, config: ScriptNamespaceConfig) => void
   listAccessibleNamespaces: (scriptId: string) => string[]
+  resolveKey: (scriptId: string, key: string) => string
   getState: (scriptId: string, key: string, defaultValue?: unknown) => Promise<unknown>
   setState: (scriptId: string, key: string, value: unknown, options?: SetOptions) => Promise<void>
   deleteState: (scriptId: string, key: string) => Promise<void>
@@ -53,7 +54,12 @@ export function js_state_register(scriptId: string, configJson: string): string 
 export function js_state_get(scriptId: string, key: string, defaultJson: string): string {
   if (!stateAPI) return "ERROR:Bridge not initialized"
   try {
-    const cacheKey = `${scriptId}:${key}`
+    // Rust 传入的是原始 key（例如 "user.profile"）
+    // 需要通过 resolveKey 转换为完整 key：
+    // - 私有命名空间：转换为 "scriptId/namespace"
+    // - 共享命名空间：保持 "namespace"
+    const fullKey = stateAPI.resolveKey(scriptId, key)
+    const cacheKey = fullKey
     
     // 从缓存读取
     if (syncCache.has(cacheKey)) {
@@ -88,7 +94,10 @@ export function js_state_set(
   if (!stateAPI) return "ERROR:Bridge not initialized"
   try {
     const value = JSON.parse(valueJson)
-    const cacheKey = `${scriptId}:${key}`
+    // Rust 传入的是原始 key（例如 "user.profile"）
+    // 需要通过 resolveKey 转换为完整 key
+    const fullKey = stateAPI.resolveKey(scriptId, key)
+    const cacheKey = fullKey
     
     // 立即更新缓存
     syncCache.set(cacheKey, value)
@@ -112,7 +121,9 @@ export function js_state_set(
 export function js_state_delete(scriptId: string, key: string): string {
   if (!stateAPI) return "ERROR:Bridge not initialized"
   try {
-    const cacheKey = `${scriptId}:${key}`
+    // Rust 传入的是原始 key，需要通过 resolveKey 转换
+    const fullKey = stateAPI.resolveKey(scriptId, key)
+    const cacheKey = fullKey
     
     // 立即从缓存删除
     syncCache.delete(cacheKey)
@@ -134,20 +145,27 @@ export function js_state_delete(scriptId: string, key: string): string {
 export function js_state_list(scriptId: string, prefix: string): string {
   if (!stateAPI) return "ERROR:Bridge not initialized"
   try {
+    // Rust 传入的是原始 prefix（例如 "user"）
+    // 需要通过 resolveKey 转换为完整前缀
+    const fullPrefix = stateAPI.resolveKey(scriptId, prefix)
+    
     // 从缓存中查找匹配的键
     const matchingKeys: string[] = []
-    const prefixKey = `${scriptId}:${prefix}`
     
-    for (const key of syncCache.keys()) {
-      if (key.startsWith(prefixKey)) {
-        matchingKeys.push(key.substring(scriptId.length + 1))
+    for (const cacheKey of syncCache.keys()) {
+      // 检查缓存键是否以 fullPrefix 开头
+      // 例如：cacheKey="script-A/user.profile", fullPrefix="script-A/user"
+      if (cacheKey.startsWith(fullPrefix)) {
+        // 返回去掉前缀后的部分
+        // 例如：cacheKey="script-A/user.profile" → "user.profile"
+        const key = cacheKey.substring(`${scriptId}/`.length)
+        matchingKeys.push(key)
       }
     }
     
     // 后台异步获取完整列表
     stateAPI.listKeys(scriptId, prefix).then(keys => {
       // 更新缓存（可选：预加载这些键的值）
-      console.log(`Background list returned ${keys.length} keys for prefix ${prefix}`)
     }).catch(err => {
       console.error(`Background list failed for ${prefix}:`, err)
     })
@@ -203,10 +221,6 @@ export async function preloadAllStateCache(): Promise<void> {
       
       syncCache.set(cacheKey, record.value)
       count++
-    }
-    
-    if (count > 0) {
-      console.log(`[State] Preloaded ${count} records`)
     }
   } catch (err) {
     // 静默失败，不影响应用启动
