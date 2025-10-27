@@ -11,5 +11,6 @@ rustflags = [
   "-C", "link-arg=-sASSERTIONS=1",
   "-C", "link-arg=-sNO_DISABLE_EXCEPTION_CATCHING",
   "-C", "link-arg=-sSUPPORT_LONGJMP=1",
-  "-C", "link-arg=-sERROR_ON_UNDEFINED_SYMBOLS=0"
+  "-C", "link-arg=-sERROR_ON_UNDEFINED_SYMBOLS=0",
+  "-C", "link-arg=-sIMPORTED_SYMBOLS=['_js_rdf_insert','_js_rdf_delete','_js_rdf_query','_js_rdf_batch_insert','_js_rdf_free']"
 ]

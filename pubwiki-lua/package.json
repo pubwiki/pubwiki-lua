@@ -35,5 +35,9 @@
   "license": "MIT",
   "devDependencies": {
     "typescript": "^5.6.3"
+  },
+  "dependencies": {
+    "@types/n3": "^1.26.1",
+    "n3": "^1.26.0"
   }
 }

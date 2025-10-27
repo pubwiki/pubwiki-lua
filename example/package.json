@@ -9,12 +9,15 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "browser-level": "^3.0.0",
+    "n3": "^1.26.0",
     "pubwiki-lua": "file:../pubwiki-lua",
+    "quadstore": "^15.4.1",
     "react": "18.3.1",
     "react-dom": "18.3.1"
   },
   "devDependencies": {
-    "vite": "5.4.8",
-    "@vitejs/plugin-react": "4.3.3"
+    "@vitejs/plugin-react": "4.3.3",
+    "vite": "5.4.8"
   }
 }

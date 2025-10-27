@@ -10,10 +10,6 @@ use std::os::raw::{c_char, c_uchar};
 use std::rc::Rc;
 use std::slice;
 
-// Newtype wrappers for Lua app_data to avoid type confusion
-#[derive(Clone)]
-struct ScriptId(String);
-
 #[derive(Clone, Default)]
 struct MediaWikiStack(Vec<String>);
 
@@ -96,13 +92,12 @@ extern "C" {
     fn free_lua_module(ptr: *const c_uchar, len: u32);
     fn get_last_fetch_error(len_out: *mut u32) -> *const c_uchar;
     
-    // 状态管理 API（同步接口）
-    fn js_state_register(script_id_ptr: *const c_char, config_json_ptr: *const c_char) -> *const c_char;
-    fn js_state_get(script_id_ptr: *const c_char, key_ptr: *const c_char, default_json_ptr: *const c_char) -> *const c_char;
-    fn js_state_set(script_id_ptr: *const c_char, key_ptr: *const c_char, value_json_ptr: *const c_char, ttl: i32) -> *const c_char;
-    fn js_state_delete(script_id_ptr: *const c_char, key_ptr: *const c_char) -> *const c_char;
-    fn js_state_list(script_id_ptr: *const c_char, prefix_ptr: *const c_char) -> *const c_char;
-    fn js_state_free(ptr: *const c_char);
+    // RDF 三元组存储 API（同步接口）
+    fn js_rdf_insert(subject_ptr: *const c_char, predicate_ptr: *const c_char, object_json_ptr: *const c_char) -> *const c_char;
+    fn js_rdf_delete(subject_ptr: *const c_char, predicate_ptr: *const c_char, object_json_ptr: *const c_char) -> *const c_char;
+    fn js_rdf_query(pattern_json_ptr: *const c_char) -> *const c_char;
+    fn js_rdf_batch_insert(triples_json_ptr: *const c_char) -> *const c_char;
+    fn js_rdf_free(ptr: *const c_char);
 }
 
 fn read_c_string(ptr: *const c_char) -> LuaResult<String> {
@@ -265,93 +260,43 @@ fn install_require_loader(lua: &Lua) -> LuaResult<()> {
     Ok(())
 }
 
-/// 安装状态管理 API 到 Lua 全局环境
-fn install_state_api(lua: &Lua) -> LuaResult<()> {
+/// 安装 RDF 三元组存储 API 到 Lua 全局环境
+fn install_rdf_api(lua: &Lua) -> LuaResult<()> {
     let state_table = lua.create_table()?;
     
-    // State.register(config) - 注册命名空间
-    let register_fn = lua.create_function(|lua, config: LuaValue| -> LuaResult<()> {
-        // 从 Lua 的 app data 获取当前脚本ID（Lua 代码无法修改）
-        let script_id = lua.app_data_ref::<ScriptId>()
-            .ok_or_else(|| LuaError::external("Script ID not set"))?;
+    // State.insert(subject, predicate, object) - 插入三元组
+    let insert_fn = lua.create_function(|lua, (subject, predicate, object): (String, String, LuaValue)| -> LuaResult<()> {
+        // 将 object 转为 JSON
+        let object_json = lua_value_to_json(lua, &object)?;
+        let subject_c = CString::new(subject).map_err(|e| LuaError::external(e))?;
+        let predicate_c = CString::new(predicate).map_err(|e| LuaError::external(e))?;
+        let object_c = CString::new(object_json).map_err(|e| LuaError::external(e))?;
         
-        // 将 config 转为 JSON
-        let config_json = lua_value_to_json(lua, &config)?;
-        let script_id_c = CString::new(script_id.0.as_str()).map_err(|e| LuaError::external(e))?;
-        let config_c = CString::new(config_json).map_err(|e| LuaError::external(e))?;
-        
-        let result_ptr = unsafe { js_state_register(script_id_c.as_ptr(), config_c.as_ptr()) };
+        let result_ptr = unsafe { js_rdf_insert(subject_c.as_ptr(), predicate_c.as_ptr(), object_c.as_ptr()) };
         let result = read_c_string(result_ptr)?;
-        unsafe { js_state_free(result_ptr) };
+        unsafe { js_rdf_free(result_ptr) };
         
         if result.starts_with("ERROR:") {
             return Err(LuaError::external(result.trim_start_matches("ERROR:")));
         }
         Ok(())
     })?;
-    state_table.set("register", register_fn)?;
+    state_table.set("insert", insert_fn)?;
     
-    // State.get(key, default) - 获取状态
-    let get_fn = lua.create_function(|lua, (key, default): (String, Option<LuaValue>)| -> LuaResult<LuaValue> {
-        // 从 Lua 的 app data 获取当前脚本ID（Lua 代码无法修改）
-        let script_id = lua.app_data_ref::<ScriptId>()
-            .ok_or_else(|| LuaError::external("Script ID not set"))?;
-        
-        let default_json = match default {
+    // State.delete(subject, predicate, object?) - 删除三元组
+    let delete_fn = lua.create_function(|lua, (subject, predicate, object): (String, String, Option<LuaValue>)| -> LuaResult<()> {
+        let object_json = match object {
             Some(val) => lua_value_to_json(lua, &val)?,
             None => "null".to_string(),
         };
         
-        let script_id_c = CString::new(script_id.0.as_str()).map_err(|e| LuaError::external(e))?;
-        let key_c = CString::new(key).map_err(|e| LuaError::external(e))?;
-        let default_c = CString::new(default_json).map_err(|e| LuaError::external(e))?;
+        let subject_c = CString::new(subject).map_err(|e| LuaError::external(e))?;
+        let predicate_c = CString::new(predicate).map_err(|e| LuaError::external(e))?;
+        let object_c = CString::new(object_json).map_err(|e| LuaError::external(e))?;
         
-        let result_ptr = unsafe { js_state_get(script_id_c.as_ptr(), key_c.as_ptr(), default_c.as_ptr()) };
+        let result_ptr = unsafe { js_rdf_delete(subject_c.as_ptr(), predicate_c.as_ptr(), object_c.as_ptr()) };
         let result = read_c_string(result_ptr)?;
-        unsafe { js_state_free(result_ptr) };
-        
-        if result.starts_with("ERROR:") {
-            return Err(LuaError::external(result.trim_start_matches("ERROR:")));
-        }
-        
-        json_to_lua_value(lua, &result)
-    })?;
-    state_table.set("get", get_fn)?;
-    
-    // State.set(key, value, ttl?) - 设置状态
-    let set_fn = lua.create_function(|lua, (key, value, ttl): (String, LuaValue, Option<i32>)| -> LuaResult<()> {
-        // 从 Lua 的 app data 获取当前脚本ID（Lua 代码无法修改）
-        let script_id = lua.app_data_ref::<ScriptId>()
-            .ok_or_else(|| LuaError::external("Script ID not set"))?;
-        
-        let value_json = lua_value_to_json(lua, &value)?;
-        let script_id_c = CString::new(script_id.0.as_str()).map_err(|e| LuaError::external(e))?;
-        let key_c = CString::new(key).map_err(|e| LuaError::external(e))?;
-        let value_c = CString::new(value_json).map_err(|e| LuaError::external(e))?;
-        
-        let result_ptr = unsafe { js_state_set(script_id_c.as_ptr(), key_c.as_ptr(), value_c.as_ptr(), ttl.unwrap_or(-1)) };
-        let result = read_c_string(result_ptr)?;
-        unsafe { js_state_free(result_ptr) };
-        
-        if result.starts_with("ERROR:") {
-            return Err(LuaError::external(result.trim_start_matches("ERROR:")));
-        }
-        Ok(())
-    })?;
-    state_table.set("set", set_fn)?;
-    
-    // State.delete(key) - 删除状态
-    let delete_fn = lua.create_function(|lua, key: String| -> LuaResult<()> {
-        // 从 Lua 的 app data 获取当前脚本ID（Lua 代码无法修改）
-        let script_id = lua.app_data_ref::<ScriptId>()
-            .ok_or_else(|| LuaError::external("Script ID not set"))?;
-        
-        let script_id_c = CString::new(script_id.0.as_str()).map_err(|e| LuaError::external(e))?;
-        let key_c = CString::new(key).map_err(|e| LuaError::external(e))?;
-        
-        let result_ptr = unsafe { js_state_delete(script_id_c.as_ptr(), key_c.as_ptr()) };
-        let result = read_c_string(result_ptr)?;
-        unsafe { js_state_free(result_ptr) };
+        unsafe { js_rdf_free(result_ptr) };
         
         if result.starts_with("ERROR:") {
             return Err(LuaError::external(result.trim_start_matches("ERROR:")));
@@ -360,18 +305,33 @@ fn install_state_api(lua: &Lua) -> LuaResult<()> {
     })?;
     state_table.set("delete", delete_fn)?;
     
-    // State.list(prefix) - 列出键
-    let list_fn = lua.create_function(|lua, prefix: String| -> LuaResult<LuaValue> {
-        // 从 Lua 的 app data 获取当前脚本ID（Lua 代码无法修改）
-        let script_id = lua.app_data_ref::<ScriptId>()
-            .ok_or_else(|| LuaError::external("Script ID not set"))?;
+    // State.query(pattern) - 查询三元组
+    // pattern 是一个 table: {subject = "...", predicate = "...", object = ...}
+    // 其中任意字段可以为 nil (表示通配符)
+    let query_fn = lua.create_function(|lua, pattern: LuaTable| -> LuaResult<LuaValue> {
+        // 构造 pattern JSON
+        let subject: Option<String> = pattern.get("subject")?;
+        let predicate: Option<String> = pattern.get("predicate")?;
+        let object: Option<LuaValue> = pattern.get("object")?;
         
-        let script_id_c = CString::new(script_id.0.as_str()).map_err(|e| LuaError::external(e))?;
-        let prefix_c = CString::new(prefix).map_err(|e| LuaError::external(e))?;
+        // 将 Lua 值直接转换为 serde_json::Value，避免双重序列化
+        let object_json = object.as_ref()
+            .map(|v| lua.from_value::<serde_json::Value>(v.clone()))
+            .transpose()?;
         
-        let result_ptr = unsafe { js_state_list(script_id_c.as_ptr(), prefix_c.as_ptr()) };
+        let pattern_json = serde_json::json!({
+            "subject": subject,
+            "predicate": predicate,
+            "object": object_json
+        });
+        
+        let pattern_str = serde_json::to_string(&pattern_json)
+            .map_err(|e| LuaError::external(format!("JSON stringify error: {}", e)))?;
+        let pattern_c = CString::new(pattern_str).map_err(|e| LuaError::external(e))?;
+        
+        let result_ptr = unsafe { js_rdf_query(pattern_c.as_ptr()) };
         let result = read_c_string(result_ptr)?;
-        unsafe { js_state_free(result_ptr) };
+        unsafe { js_rdf_free(result_ptr) };
         
         if result.starts_with("ERROR:") {
             return Err(LuaError::external(result.trim_start_matches("ERROR:")));
@@ -379,7 +339,25 @@ fn install_state_api(lua: &Lua) -> LuaResult<()> {
         
         json_to_lua_value(lua, &result)
     })?;
-    state_table.set("list", list_fn)?;
+    state_table.set("query", query_fn)?;
+    
+    // State.batchInsert(triples) - 批量插入三元组
+    // triples 是一个数组: {{subject = "...", predicate = "...", object = ...}, ...}
+    let batch_insert_fn = lua.create_function(|lua, triples: LuaTable| -> LuaResult<()> {
+        // 将 Lua table 转换为 JSON 数组
+        let triples_json = lua_value_to_json(lua, &LuaValue::Table(triples))?;
+        let triples_c = CString::new(triples_json).map_err(|e| LuaError::external(e))?;
+        
+        let result_ptr = unsafe { js_rdf_batch_insert(triples_c.as_ptr()) };
+        let result = read_c_string(result_ptr)?;
+        unsafe { js_rdf_free(result_ptr) };
+        
+        if result.starts_with("ERROR:") {
+            return Err(LuaError::external(result.trim_start_matches("ERROR:")));
+        }
+        Ok(())
+    })?;
+    state_table.set("batchInsert", batch_insert_fn)?;
     
     lua.globals().set("State", state_table)?;
     Ok(())
@@ -402,7 +380,7 @@ fn json_to_lua_value(lua: &Lua, json: &str) -> LuaResult<LuaValue> {
 }
 
 #[no_mangle]
-pub extern "C" fn lua_run(code_ptr: *const c_char, script_id_ptr: *const c_char) -> *const c_char {
+pub extern "C" fn lua_run(code_ptr: *const c_char) -> *const c_char {
     // 辅助函数：创建 JSON 格式的错误结果
     let make_error = |msg: String| -> *const c_char {
         // 返回统一格式: {"result": null, "error": "错误信息"}
@@ -416,14 +394,15 @@ pub extern "C" fn lua_run(code_ptr: *const c_char, script_id_ptr: *const c_char)
     };
     
     // 辅助函数：创建 JSON 格式的成功结果
-    let make_success = |result: serde_json::Value| -> *const c_char {
-        // 返回统一格式: {"result": ..., "error": null}
+    let make_success = |result: serde_json::Value, output: String| -> *const c_char {
+        // 返回统一格式: {"result": ..., "output": "...", "error": null}
         let success_json = serde_json::json!({
             "result": result,
+            "output": output,
             "error": serde_json::Value::Null
         });
         CString::new(success_json.to_string())
-            .unwrap_or_else(|_| CString::new(r#"{"result":null,"error":"<invalid utf8>"}"#).unwrap())
+            .unwrap_or_else(|_| CString::new(r#"{"result":null,"output":"","error":"<invalid utf8>"}"#).unwrap())
             .into_raw()
     };
     
@@ -432,17 +411,8 @@ pub extern "C" fn lua_run(code_ptr: *const c_char, script_id_ptr: *const c_char)
         Err(e) => return make_error(format!("Failed to read code: {}", e)),
     };
 
-    let script_id = match read_c_string(script_id_ptr) {
-        Ok(s) => s,
-        Err(e) => return make_error(format!("Failed to read script_id: {}", e)),
-    };
-
     let output = Rc::new(RefCell::new(String::new()));
     let lua = Lua::new();
-    
-    // 将 scriptId 存储在 Lua 的 app data 中（使用 newtype wrapper）
-    // 每个 Lua VM 实例独立，Lua 代码无法访问
-    lua.set_app_data(ScriptId(script_id));
 
     if let Err(e) = install_print_collector(&lua, &output) {
         return make_error(format!("Failed to install print collector: {}", e));
@@ -456,8 +426,8 @@ pub extern "C" fn lua_run(code_ptr: *const c_char, script_id_ptr: *const c_char)
         return make_error(format!("Failed to install require loader: {}", e));
     }
 
-    if let Err(e) = install_state_api(&lua) {
-        return make_error(format!("Failed to install State API: {}", e));
+    if let Err(e) = install_rdf_api(&lua) {
+        return make_error(format!("Failed to install RDF API: {}", e));
     }
 
     let value = match lua.load(&code).set_name("input").eval::<LuaValue>() {
@@ -489,7 +459,10 @@ pub extern "C" fn lua_run(code_ptr: *const c_char, script_id_ptr: *const c_char)
         }
     };
     
-    make_success(result_value)
+    // 获取捕获的输出
+    let captured_output = output.borrow().clone();
+    
+    make_success(result_value, captured_output)
 }
 
 /// 释放由 lua_run 返回的结果字符串
