@@ -1,22 +1,16 @@
 # pubwiki-lua
 
-A small TypeScript library that wraps the Emscripten-compiled Lua runtime, including MediaWiki-style `require` resolution. Assets are bundled with the package so you can drop it into any web project without copying glue files by hand.
+A TypeScript library that wraps an Emscripten-compiled Lua 5.4 runtime with RDF triple store integration and MediaWiki module support.
 
 ## Features
 
-- Lazy-loads the WebAssembly Lua runner and keeps it cached while your app runs.
-- `require` support for:
-  - MediaWiki modules via the JSON API (`mediawiki://example.org/Module:Foo`).
-  - Arbitrary HTTP/HTTPS URLs.
-  - Ephemeral file uploads you register at runtime.
-- Friendly helpers for managing file-module lifecycle and cache state.
-- **Namespace state management** with pluggable storage backends:
-  - Built-in IndexedDB backend (default)
-  - Built-in Memory backend (for testing)
-  - Built-in LocalStorage backend (for simple cases)
-  - Custom backend interface for advanced use cases
-- **Concurrent-safe**: Multiple `runLua` calls can execute concurrently with different `scriptId`s
-- **Secure**: Scripts cannot forge their identity or access other scripts' namespaces
+- **Lua 5.4 Runtime**: Full-featured Lua VM compiled to WebAssembly
+- **RDF State API**: Built-in triple store for semantic data management
+- **MediaWiki require()**: Load modules from MediaWiki sites via JSON API
+- **HTTP/HTTPS modules**: Fetch Lua code from any URL
+- **In-memory modules**: Register ephemeral file modules at runtime
+- **Pluggable Storage**: Integrate with any RDF store (Quadstore, N3.js, custom backends)
+- **Type-Safe**: Full TypeScript support with comprehensive type definitions
 
 ## Installation
 
@@ -24,159 +18,318 @@ A small TypeScript library that wraps the Emscripten-compiled Lua runtime, inclu
 npm install pubwiki-lua
 ```
 
-## Usage
+## Quick Start
 
 ```ts
-import {
-  loadRunner,
-  runLua,
-  registerFileModule,
-  clearRemoteModuleCache
-} from 'pubwiki-lua'
+import { loadRunner, runLua } from 'pubwiki-lua'
+import { QuadstoreRDFStore } from './your-rdf-store'
 
+// Initialize the Lua runtime
 await loadRunner()
 
-registerFileModule('Module:MyHelpers', `return {
-  greet = function(name)
-    return 'Hi, ' .. name
+// Create an RDF store instance
+const store = new QuadstoreRDFStore()
+
+// Run Lua code with RDF state access
+const result = await runLua(`
+  -- Insert RDF triples
+  State.insert('user:alice', 'name', 'Alice')
+  State.insert('user:alice', 'age', 30)
+  State.insert('user:alice', 'city', 'Tokyo')
+  
+  -- Query triples
+  local user_data = State.query({subject = 'user:alice'})
+  
+  print('Alice has ' .. #user_data .. ' properties')
+  for i, triple in ipairs(user_data) do
+    print(triple.predicate .. ': ' .. tostring(triple.object))
   end
-}`)
+  
+  return 'Done'
+`, store)
 
-// runLua requires a scriptId for permission control and state isolation
-const output = await runLua(`
-  local helpers = require('file://Module:MyHelpers')
-  return helpers.greet('世界')
-`, 'my-script')
-
-console.log(output) // => Hi, 世界
-
-clearRemoteModuleCache()
+console.log(result)
 ```
 
-## State Management
+## RDF State API
 
-pubwiki-lua includes a built-in state management system with pluggable storage backends. By default, state is persisted in IndexedDB.
+The Lua `State` object provides methods for working with RDF triples:
+
+### State.insert(subject, predicate, object)
+
+Insert a single triple into the store.
+
+```lua
+State.insert('book:1984', 'title', '1984')
+State.insert('book:1984', 'author', 'George Orwell')
+State.insert('book:1984', 'year', 1949)
+State.insert('book:1984', 'genre', 'dystopian')
+```
+
+### State.delete(subject, predicate, object?)
+
+Delete triples matching the pattern. If `object` is omitted, deletes all triples with matching subject and predicate.
+
+```lua
+-- Delete a specific triple
+State.delete('book:1984', 'year', 1949)
+
+-- Delete all triples with subject + predicate
+State.delete('book:1984', 'genre')
+```
+
+### State.query(pattern)
+
+Query triples matching a pattern. Use `nil` for wildcards.
+
+```lua
+-- Find all books (any subject with 'title' predicate)
+local books = State.query({predicate = 'title'})
+
+-- Find all properties of a specific book
+local book_data = State.query({subject = 'book:1984'})
+
+-- Find books of a specific genre
+local dystopian = State.query({
+  predicate = 'genre',
+  object = 'dystopian'
+})
+
+-- Get book titles from results
+for i, triple in ipairs(dystopian) do
+  local titles = State.query({
+    subject = triple.subject,
+    predicate = 'title'
+  })
+  if #titles > 0 then
+    print(titles[1].object)
+  end
+end
+```
+
+### State.batchInsert(triples)
+
+Insert multiple triples at once for better performance.
+
+```lua
+local products = {
+  {subject = 'product:p1', predicate = 'name', object = 'Laptop'},
+  {subject = 'product:p1', predicate = 'price', object = 999},
+  {subject = 'product:p2', predicate = 'name', object = 'Mouse'},
+  {subject = 'product:p2', predicate = 'price', object = 29},
+}
+
+State.batchInsert(products)
+```
+
+## RDFStore Interface
+
+To use pubwiki-lua, you need to provide an RDFStore implementation. The library provides a sync adapter for async stores.
+
+### Interface
+
+```typescript
+export interface RDFStore {
+  insert(subject: string, predicate: string, object: any): Promise<void> | void
+  delete(subject: string, predicate: string, object?: any): Promise<void> | void
+  query(pattern: TriplePattern): Promise<Triple[]> | Triple[]
+  batchInsert?(triples: Triple[]): Promise<void> | void
+}
+
+export interface Triple {
+  subject: string
+  predicate: string
+  object: any
+}
+
+export interface TriplePattern {
+  subject?: string | null
+  predicate?: string | null
+  object?: any | null
+}
+```
+
+### Example: Quadstore Backend
+
+```typescript
+import { Quadstore } from 'quadstore'
+import { MemoryLevel } from 'memory-level'
+import { DataFactory } from 'n3'
+
+export class QuadstoreRDFStore implements RDFStore {
+  private store: Quadstore
+  
+  constructor() {
+    const backend = new MemoryLevel()
+    this.store = new Quadstore({
+      backend,
+      dataFactory: DataFactory
+    })
+  }
+  
+  async insert(subject: string, predicate: string, object: any) {
+    await this.store.put(this.tripleToQuad({ subject, predicate, object }))
+  }
+  
+  async delete(subject: string, predicate: string, object?: any) {
+    const pattern = { subject, predicate, object }
+    await this.store.deleteMatches(/* ... */)
+  }
+  
+  async query(pattern: TriplePattern): Promise<Triple[]> {
+    const results = await this.store.getStream(/* ... */)
+    return results.map(this.quadToTriple)
+  }
+  
+  // ... helper methods
+}
+```
+
+### Sync Adapter
+
+For async stores, use the provided sync adapter:
+
+```typescript
+import { createSyncAdapter } from 'pubwiki-lua/rdf-bridge'
+
+const asyncStore = new QuadstoreRDFStore()
+const syncStore = createSyncAdapter(asyncStore)
+
+await runLua(luaCode, syncStore)
+```
+
+The sync adapter uses N3.js Store as an in-memory cache, providing synchronous access while persisting to the async store in the background.
+
+## MediaWiki require() Support
+
+Load Lua modules from MediaWiki sites, HTTP endpoints, or in-memory files.
 
 ### Basic Usage
 
 ```ts
-import { loadRunner, runLua, registerNamespaces } from 'pubwiki-lua'
+import { registerFileModule } from 'pubwiki-lua'
 
-await loadRunner()
+// Register an in-memory module
+registerFileModule('Module:MyHelpers', `
+return {
+  greet = function(name)
+    return 'Hello, ' .. name
+  end
+}
+`)
 
-// Register namespace access for a script
-registerNamespaces('my-script', {
-  allowedNamespaces: ['default', 'user-data'],
-  defaultNamespace: 'default'
-})
-
-// Use state in Lua - scriptId is passed as the second parameter
+// Use in Lua
 const result = await runLua(`
-  -- Set state (persists across page reloads)
-  State.set("count", 42)
-  
-  -- Get state
-  local count = State.get("count")
-  
-  -- Use with default value
-  local name = State.get("username", "anonymous")
-  
-  return "Count: " .. count
-`, 'my-script'), 'my-script')
+  local helpers = require('file://Module:MyHelpers')
+  return helpers.greet('World')
+`, store)
 ```
 
-### Custom Storage Backends
+### MediaWiki Modules
 
-You can use a different storage backend or implement your own:
+```lua
+-- Load from MediaWiki site
+local module = require('mediawiki://en.wikipedia.org/Module:String')
+return module.upper('hello')
+```
+
+### HTTP/HTTPS Modules
+
+```lua
+-- Load from any URL
+local lib = require('https://example.com/lua/mylib.lua')
+return lib.someFunction()
+```
+
+### Module Management
 
 ```ts
-import { loadRunner, setStorageBackend, MemoryBackend } from 'pubwiki-lua'
+import { 
+  uploadFileModule,
+  clearModuleCache,
+  registerFileModule 
+} from 'pubwiki-lua'
 
-// Use in-memory storage (doesn't persist)
-setStorageBackend(new MemoryBackend())
-await loadRunner()
+// Upload a module
+uploadFileModule('file://Module:Utils', luaCode)
+
+// Clear remote module cache
+clearModuleCache()
 ```
 
-See [STORAGE_BACKENDS.md](./STORAGE_BACKENDS.md) for complete documentation on:
-- Built-in backends (IndexedDB, Memory, LocalStorage)
-- Creating custom backends
-- Advanced examples (Remote API, Hybrid caching, Encryption)
-- Testing and best practices
+## Advanced Configuration
 
-### Namespace Isolation
+### Custom WASM Path
 
-From v1.0.0+, pubwiki-lua automatically isolates namespaces between different scripts to prevent collisions. Each script's private namespaces are automatically prefixed with its `scriptId`:
+If you need to host WASM files on a CDN:
 
 ```ts
-// Script A
-registerNamespaces('script-A', {
-  'user.profile': {
-    permissions: { read: true, write: true, delete: false }
-  }
-})
+import { loadRunner } from 'pubwiki-lua'
 
-await runLua('script-A', `
-  State.set('user.profile', { name = 'Alice' })
-`)
-// Actually stored as: 'script-A/user.profile'
-
-// Script B
-registerNamespaces('script-B', {
-  'user.profile': {
-    permissions: { read: true, write: true, delete: false }
-  }
-})
-
-await runLua('script-B', `
-  State.set('user.profile', { name = 'Bob' })
-`)
-// Actually stored as: 'script-B/user.profile'
-
-// Data is completely isolated between scripts
+await loadRunner('/cdn/path/to/lua_runner_glue.js')
 ```
 
-**Shared Namespaces**: If you want multiple scripts to share data, mark the namespace as `shared: true`:
+### Print Output
+
+The `runLua` function returns both print output and return values:
 
 ```ts
-registerNamespaces('script-A', {
-  'global.events': {
-    shared: true,
-    permissions: { read: true, write: true, delete: false }
-  }
-})
+const output = await runLua(`
+  print('Debug message')
+  print('Another message')
+  return 42
+`, store)
 
-registerNamespaces('script-B', {
-  'global.events': {
-    shared: true,
-    permissions: { read: true, write: false, delete: false }
-  }
-})
-
-// Both scripts can access 'global.events' (no prefix added)
+// Output includes both prints and return value:
+// "Debug message\nAnother message\n42"
 ```
 
-See [NAMESPACE_SCOPING.md](../NAMESPACE_SCOPING.md) for complete documentation on:
-- Namespace types (private, shared, script-specific)
-- Auto-prefix mechanism
-- Permission management for shared namespaces
-- Migration guide from older versions
-- Best practices and common patterns
+## Resource URIs
 
-## Assets
+Strings starting with `resource://` are treated as RDF resource URIs (NamedNodes), all other values are literals:
 
-The package publishes its WebAssembly glue in `wasm/`. If you need to host those files elsewhere (for example, behind a CDN path), call `setGluePath()` once before `loadRunner()`.
+```lua
+-- This creates a NamedNode → Literal relationship
+State.insert('resource://user:alice', 'name', 'Alice')
 
-```ts
-import { setGluePath } from 'pubwiki-lua'
-
-setGluePath('/static/pubwiki-lua/lua_runner_glue.js')
+-- This creates a NamedNode → NamedNode relationship
+State.insert('resource://post:1', 'author', 'resource://user:alice')
 ```
 
-## Building locally
+## Building Locally
 
 ```sh
-npm install
-npm run build
+pnpm install
+pnpm run build
 ```
 
 The build emits ESM JavaScript and type declarations into `dist/`.
+
+## TypeScript API
+
+```typescript
+// Core functions
+export function loadRunner(customGluePath?: string): Promise<void>
+export function runLua(code: string, store: SyncRDFStore): Promise<string>
+
+// Module management
+export function registerFileModule(name: string, content: string): void
+export function uploadFileModule(name: string, content: string): void
+export function clearModuleCache(): void
+
+// RDF bridge
+export function createSyncAdapter(store: RDFStore): SyncRDFStore
+export function setRDFStore(store: SyncRDFStore): void
+export function clearRDFStore(): void
+
+// Types
+export interface RDFStore { /* ... */ }
+export interface SyncRDFStore { /* ... */ }
+export interface Triple { /* ... */ }
+export interface TriplePattern { /* ... */ }
+```
+
+## License
+
+MIT
+

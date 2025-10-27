@@ -359,6 +359,78 @@ fn install_rdf_api(lua: &Lua) -> LuaResult<()> {
     })?;
     state_table.set("batchInsert", batch_insert_fn)?;
     
+    // State.set(subject, predicate, object) - 设置三元组（先删除后插入）
+    // 删除所有匹配 subject + predicate 的三元组，然后插入新的三元组
+    let set_fn = lua.create_function(|lua, (subject, predicate, object): (String, String, LuaValue)| -> LuaResult<()> {
+        // 1. 先删除所有匹配的三元组（不指定 object，删除所有）
+        let subject_c = CString::new(subject.clone()).map_err(|e| LuaError::external(e))?;
+        let predicate_c = CString::new(predicate.clone()).map_err(|e| LuaError::external(e))?;
+        let null_c = CString::new("null").map_err(|e| LuaError::external(e))?;
+        
+        let delete_result_ptr = unsafe { js_rdf_delete(subject_c.as_ptr(), predicate_c.as_ptr(), null_c.as_ptr()) };
+        let delete_result = read_c_string(delete_result_ptr)?;
+        unsafe { js_rdf_free(delete_result_ptr) };
+        
+        if delete_result.starts_with("ERROR:") {
+            return Err(LuaError::external(delete_result.trim_start_matches("ERROR:")));
+        }
+        
+        // 2. 插入新的三元组
+        let object_json = lua_value_to_json(lua, &object)?;
+        let subject_c = CString::new(subject).map_err(|e| LuaError::external(e))?;
+        let predicate_c = CString::new(predicate).map_err(|e| LuaError::external(e))?;
+        let object_c = CString::new(object_json).map_err(|e| LuaError::external(e))?;
+        
+        let insert_result_ptr = unsafe { js_rdf_insert(subject_c.as_ptr(), predicate_c.as_ptr(), object_c.as_ptr()) };
+        let insert_result = read_c_string(insert_result_ptr)?;
+        unsafe { js_rdf_free(insert_result_ptr) };
+        
+        if insert_result.starts_with("ERROR:") {
+            return Err(LuaError::external(insert_result.trim_start_matches("ERROR:")));
+        }
+        
+        Ok(())
+    })?;
+    state_table.set("set", set_fn)?;
+    
+    // State.get(subject, predicate) - 获取单个值
+    // 查询匹配 subject + predicate 的三元组，返回第一个结果的 object，如果没有则返回 nil
+    let get_fn = lua.create_function(|lua, (subject, predicate): (String, String)| -> LuaResult<LuaValue> {
+        // 构造查询 pattern
+        let pattern_json = serde_json::json!({
+            "subject": subject,
+            "predicate": predicate,
+            "object": serde_json::Value::Null
+        });
+        
+        let pattern_str = serde_json::to_string(&pattern_json)
+            .map_err(|e| LuaError::external(format!("JSON stringify error: {}", e)))?;
+        let pattern_c = CString::new(pattern_str).map_err(|e| LuaError::external(e))?;
+        
+        // 调用查询
+        let result_ptr = unsafe { js_rdf_query(pattern_c.as_ptr()) };
+        let result = read_c_string(result_ptr)?;
+        unsafe { js_rdf_free(result_ptr) };
+        
+        if result.starts_with("ERROR:") {
+            return Err(LuaError::external(result.trim_start_matches("ERROR:")));
+        }
+        
+        // 解析结果数组
+        let triples: Vec<serde_json::Value> = serde_json::from_str(&result)
+            .map_err(|e| LuaError::external(format!("JSON parse error: {}", e)))?;
+        
+        // 如果有结果，返回第一个三元组的 object；否则返回 nil
+        if let Some(first_triple) = triples.first() {
+            if let Some(object) = first_triple.get("object") {
+                return lua.to_value(object);
+            }
+        }
+        
+        Ok(LuaValue::Nil)
+    })?;
+    state_table.set("get", get_fn)?;
+    
     lua.globals().set("State", state_table)?;
     Ok(())
 }
