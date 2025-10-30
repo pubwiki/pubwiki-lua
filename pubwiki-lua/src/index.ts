@@ -20,6 +20,11 @@ import {
 export type { RDFStore, SyncRDFStore, Triple, TriplePattern } from './rdf-types'
 export { createSyncAdapter } from './rdf-bridge'
 
+// ============= 环境检测 =============
+
+const isBrowser = typeof window !== 'undefined' && typeof document !== 'undefined'
+const isNode = typeof process !== 'undefined' && process.versions != null && process.versions.node != null
+
 // ============= WASM 模块管理 =============
 
 const textEncoder = new TextEncoder()
@@ -83,18 +88,28 @@ function allocateImportBytes(bytes: Uint8Array, module: LuaModule) {
  * 同步 HTTP GET 请求（用于 require）
  */
 function httpGetSync(url: string): string {
-  const xhr = new XMLHttpRequest()
-  xhr.open('GET', url, false)
-  xhr.overrideMimeType('text/plain; charset=utf-8')
-  try {
-    xhr.send(null)
-  } catch (error) {
-    throw new Error(`Network error while fetching ${url}: ${error}`)
+  if (isBrowser) {
+    // 浏览器环境：使用 XMLHttpRequest
+    const xhr = new XMLHttpRequest()
+    xhr.open('GET', url, false)
+    xhr.overrideMimeType('text/plain; charset=utf-8')
+    try {
+      xhr.send(null)
+    } catch (error) {
+      throw new Error(`Network error while fetching ${url}: ${error}`)
+    }
+    if (xhr.status >= 200 && xhr.status < 300) {
+      return xhr.responseText
+    }
+    throw new Error(`HTTP ${xhr.status} while fetching ${url}`)
+  } else if (isNode) {
+    // Node.js 环境：使用 node:https 或 node:http（同步方式）
+    // 注意：Node.js 中真正的同步 HTTP 请求需要特殊处理
+    // 这里提供一个简单的实现，实际项目中可能需要使用 sync-request 等库
+    throw new Error('Synchronous HTTP requests are not supported in Node.js environment. Please use async require or register modules via registerFileModule().')
+  } else {
+    throw new Error('Unsupported environment for HTTP requests')
   }
-  if (xhr.status >= 200 && xhr.status < 300) {
-    return xhr.responseText
-  }
-  throw new Error(`HTTP ${xhr.status} while fetching ${url}`)
 }
 
 /**
@@ -224,7 +239,14 @@ function resolveResourcePath(baseHref: string, file: string): string {
 // 辅助函数：从资源 URL 中提取基础路径
 function deriveBasePath(resource: string): string {
   try {
-    const url = new URL(resource, typeof document !== 'undefined' ? document.baseURI : undefined)
+    // 在 Node.js 中，如果是文件路径，使用 file:// 协议
+    const baseURI = isBrowser && typeof document !== 'undefined' 
+      ? document.baseURI 
+      : isNode 
+        ? import.meta.url 
+        : undefined
+    
+    const url = new URL(resource, baseURI)
     url.hash = ''
     url.search = ''
     const pathname = url.pathname.replace(/[^/]*$/, '')
@@ -264,29 +286,52 @@ export async function loadRunner(customGluePath?: string): Promise<void> {
       const glueHref = gluePath
       console.log('[loadRunner] Fetching glue file:', glueHref)
       
-      // 获取 glue JS 文件
-      const response = await fetch(glueHref)
-      if (!response.ok) {
-        throw new Error(`Failed to fetch ${glueHref}: ${response.status}`)
-      }
-      const source = await response.text()
+      let basePath: string
+      let factoryModule: any
       
-      // 创建 blob URL 并导入
-      const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }))
-      const basePath = deriveBasePath(glueHref)
-      console.log('[loadRunner] Base path:', basePath)
-
-      const factoryModule = await import(/* @vite-ignore */ blobUrl)
+      if (isNode) {
+        // Node.js 环境：直接导入文件（避免 data URL 导致的环境检测问题）
+        const { pathToFileURL, fileURLToPath } = await import('node:url')
+        const path = await import('node:path')
+        
+        // 处理 file:// URL 或相对路径
+        const fileUrl = glueHref.startsWith('file://') 
+          ? glueHref
+          : pathToFileURL(path.resolve(glueHref)).href
+        
+        const filePath = fileURLToPath(fileUrl)
+        basePath = 'file://' + path.dirname(filePath) + '/'
+        console.log('[loadRunner] Base path (Node.js):', basePath)
+        
+        // 直接导入模块
+        factoryModule = await import(/* @vite-ignore */ fileUrl)
+      } else {
+        // 浏览器环境：使用 fetch + blob URL
+        const response = await fetch(glueHref)
+        if (!response.ok) {
+          throw new Error(`Failed to fetch ${glueHref}: ${response.status}`)
+        }
+        const source = await response.text()
+        basePath = deriveBasePath(glueHref)
+        console.log('[loadRunner] Base path (Browser):', basePath)
+        
+        // 使用 blob URL 导入
+        const blobUrl = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }))
+        factoryModule = await import(/* @vite-ignore */ blobUrl)
+      }
+      
       const factory = (factoryModule.default ?? factoryModule) as LuaModuleFactory
 
       let localModule: LuaModule | null = null
 
       // Emscripten 模块配置
-      const moduleConfig = {
+      const moduleConfig: any = {
         // 资源定位函数
-        locateFile: (path: string) => resolveResourcePath(basePath, path),
-        
-        // instantiateWasm 回调，用于注入自定义导入函数
+        locateFile: (path: string, scriptDirectory: string) => {
+          console.log('[loadRunner] locateFile called:', path, 'from', scriptDirectory)
+          // 始终使用 basePath + filename
+          return basePath + path
+        },        // instantiateWasm 回调，用于注入自定义导入函数
         instantiateWasm: async (imports: WebAssembly.Imports, successCallback: (instance: WebAssembly.Instance, module: WebAssembly.Module) => void) => {
           console.log('[loadRunner] instantiateWasm callback called')
           
@@ -415,29 +460,45 @@ export async function loadRunner(customGluePath?: string): Promise<void> {
           const wasmPath = resolveResourcePath(basePath, 'lua_runner_wasm.wasm')
           console.log('[loadRunner] Loading WASM file:', wasmPath)
           
-          const fetchWasm = () => fetch(wasmPath, { credentials: 'same-origin' })
-          
-          const instantiateFromResponse = async (responsePromise: Promise<Response>) => {
-            const wasmResponse = await responsePromise
-            if (!wasmResponse.ok) {
-              throw new Error(`Failed to fetch ${wasmPath}: ${wasmResponse.status}`)
-            }
-            const bytes = await wasmResponse.arrayBuffer()
-            return WebAssembly.instantiate(bytes, imports)
-          }
-          
           let result: WebAssembly.WebAssemblyInstantiatedSource
-          if (WebAssembly.instantiateStreaming) {
-            try {
-              console.log('[loadRunner] Using instantiateStreaming...')
-              result = await WebAssembly.instantiateStreaming(fetchWasm(), imports)
-            } catch (error) {
-              console.warn('[loadRunner] Falling back to ArrayBuffer instantiation:', error)
+          
+          if (isNode) {
+            // Node.js：使用 fs 读取 WASM 文件
+            const fs = await import('node:fs/promises')
+            const { fileURLToPath } = await import('node:url')
+            
+            const wasmFilePath = wasmPath.startsWith('file://')
+              ? fileURLToPath(wasmPath)
+              : wasmPath
+            
+            console.log('[loadRunner] Reading WASM file (Node.js):', wasmFilePath)
+            const wasmBuffer = await fs.readFile(wasmFilePath)
+            result = await WebAssembly.instantiate(wasmBuffer, imports)
+          } else {
+            // 浏览器：使用 fetch
+            const fetchWasm = () => fetch(wasmPath, { credentials: 'same-origin' })
+            
+            const instantiateFromResponse = async (responsePromise: Promise<Response>) => {
+              const wasmResponse = await responsePromise
+              if (!wasmResponse.ok) {
+                throw new Error(`Failed to fetch ${wasmPath}: ${wasmResponse.status}`)
+              }
+              const bytes = await wasmResponse.arrayBuffer()
+              return WebAssembly.instantiate(bytes, imports)
+            }
+            
+            if (WebAssembly.instantiateStreaming) {
+              try {
+                console.log('[loadRunner] Using instantiateStreaming...')
+                result = await WebAssembly.instantiateStreaming(fetchWasm(), imports)
+              } catch (error) {
+                console.warn('[loadRunner] Falling back to ArrayBuffer instantiation:', error)
+                result = await instantiateFromResponse(fetchWasm())
+              }
+            } else {
+              console.log('[loadRunner] Using ArrayBuffer instantiation...')
               result = await instantiateFromResponse(fetchWasm())
             }
-          } else {
-            console.log('[loadRunner] Using ArrayBuffer instantiation...')
-            result = await instantiateFromResponse(fetchWasm())
           }
           
           console.log('[loadRunner] WASM instantiated successfully')

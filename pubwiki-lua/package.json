@@ -24,6 +24,10 @@
     "build": "tsc --project tsconfig.json",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "prepublishOnly": "npm run clean && npm run build"
   },
   "keywords": [
@@ -34,7 +38,9 @@
   "author": "",
   "license": "MIT",
   "devDependencies": {
-    "typescript": "^5.6.3"
+    "@vitest/ui": "^4.0.5",
+    "typescript": "^5.6.3",
+    "vitest": "^4.0.5"
   },
   "dependencies": {
     "@types/n3": "^1.26.1",

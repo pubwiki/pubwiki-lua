@@ -22,7 +22,7 @@ ensure-emsdk:
 # Build the Rust WASM runner and copy artifacts into the TypeScript package
 wasm: ensure-emsdk
 	rustup target add wasm32-unknown-emscripten
-	cargo build --release --target wasm32-unknown-emscripten --manifest-path {{justfile_directory()}}/{{RUNNER}}/Cargo.toml
+	cd {{justfile_directory()}}/{{RUNNER}} && cargo build --release --target wasm32-unknown-emscripten 
 	mkdir -p {{justfile_directory()}}/{{LIB}}/wasm
 	if [ -f {{justfile_directory()}}/{{RUNNER}}/target/wasm32-unknown-emscripten/release/lua_runner_wasm.js ]; then \
 	  cp -f {{justfile_directory()}}/{{RUNNER}}/target/wasm32-unknown-emscripten/release/lua_runner_wasm.js {{justfile_directory()}}/{{LIB}}/wasm/lua_runner_glue.js; \
